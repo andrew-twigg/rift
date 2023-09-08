@@ -55,6 +55,7 @@ ModelType = Literal["openai", "hf", "gpt4all"]
 
 class CodeCapabilitiesServer:
     server: Optional[LspServer] = None
+
     def __init__(
         self,
         lsp_host: LspHost = "127.0.0.1",
@@ -76,7 +77,7 @@ class CodeCapabilitiesServer:
         except Exception as e:
             logger.error("caught: " + str(e))
             logger.info(
-                f"connection closed, but Rift is still running and accepting new connections."
+                "connection closed, but Rift is still running and accepting new connections."
             )
 
     async def run_lsp_tcp_client_mode(self):
@@ -90,7 +91,9 @@ class CodeCapabilitiesServer:
         assert isinstance(self.lsp_host, str)
         assert isinstance(self.lsp_port, int)
         try:
-            server = await asyncio.start_server(self.on_lsp_connection, self.lsp_host, self.lsp_port)
+            server = await asyncio.start_server(
+                self.on_lsp_connection, self.lsp_host, self.lsp_port
+            )
         except OSError as e:
             logger.error(str(e))
             logger.info(f"try connecting to {self.lsp_host}:{self.lsp_port}")
@@ -117,7 +120,6 @@ class CodeCapabilitiesServer:
         )
         return lsp_task
 
-
     async def run_forever(self):
         """Runs the language server.
 
@@ -127,7 +129,7 @@ class CodeCapabilitiesServer:
         loop = asyncio.get_event_loop()
         lsp_task = await self._run_forever_fut()
         await lsp_task
-        logger.debug(f"exiting {type(self).__name__}.listen_forever")        
+        logger.debug(f"exiting {type(self).__name__}.listen_forever")
 
 
 def create_metaserver(
@@ -173,12 +175,19 @@ def main(
     port: LspPort = 7797,
     version=False,
     debug=False,
+    socket: LspPort = 7797,
 ):
+    if socket != port:
+        port = int(socket)
+        logger.info(f"setting port={int(socket)}")
     metaserver = create_metaserver(host, port, version, debug)
-    asyncio.run(metaserver.run_forever(), debug=debug)
+    if metaserver:
+        asyncio.run(metaserver.run_forever(), debug=debug)
 
+
+def entrypoint():
+    import fire
+    fire.Fire(main)
 
 if __name__ == "__main__":
-    import fire
-
-    fire.Fire(main)
+    entrypoint()

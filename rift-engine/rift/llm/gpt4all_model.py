@@ -1,31 +1,35 @@
 import asyncio
 import ctypes
 import logging
-from pathlib import Path
 import threading
-from typing import Optional, List
+from functools import cache
+from pathlib import Path
+from typing import Any, List, Optional
 
-from pydantic import BaseSettings, Field
-from rift.llm.abstract import (
-    AbstractCodeCompletionProvider,
-    InsertCodeResult,
-    AbstractChatCompletionProvider,
-    ChatResult,
-)
-from rift.llm.openai_types import Message
+from gpt4all import GPT4All
 from gpt4all.pyllmodel import (
     LLModel,
     LLModelPromptContext,
-    llmodel,
     PromptCallback,
-    ResponseCallback,
     RecalculateCallback,
+    ResponseCallback,
+    llmodel,
 )
+from pydantic import BaseSettings
 
-from gpt4all import GPT4All
-
-from functools import cache
-
+from rift.llm.abstract import (
+    AbstractChatCompletionProvider,
+    AbstractCodeCompletionProvider,
+    ChatResult,
+    InsertCodeResult,
+)
+from rift.llm.openai_client import (
+    calc_max_system_message_size,
+    create_system_message_chat_truncated,
+    messages_size,
+    truncate_messages,
+)
+from rift.llm.openai_types import Message
 from rift.util.TextStream import TextStream
 
 logger = logging.getLogger(__name__)
@@ -33,31 +37,10 @@ logger = logging.getLogger(__name__)
 from threading import Lock
 
 # ENCODER = get_encoding("cl100k_base")
-from transformers import LlamaTokenizer
+# from transformers import LlamaTokenizer
+import transformers
 
-ENCODER = LlamaTokenizer.from_pretrained("oobabooga/llama-tokenizer")
 ENCODER_LOCK = Lock()
-
-
-@cache
-def get_num_tokens(content):
-    return len(ENCODER.encode(content))
-
-
-def message_length(msg: Message):
-    with ENCODER_LOCK:
-        return get_num_tokens(msg.content)
-
-
-def auto_truncate(messages: List[Message]):
-    tail_messages: List[Message] = []
-    running_length = 0
-    for msg in reversed(messages[1:]):
-        running_length += message_length(msg)
-        if running_length > 1536:
-            break
-        tail_messages.insert(0, msg)
-    return [messages[0]] + tail_messages
 
 
 generate_lock = asyncio.Lock()
@@ -106,7 +89,6 @@ def generate_stream(self: LLModel, prompt: str, **kwargs) -> TextStream:
         return is_recalculating
 
     def run():
-        logger.debug("starting gpt4all model")
         return llmodel.llmodel_prompt(
             self.model,
             prompt_chars,
@@ -125,8 +107,30 @@ def generate_stream(self: LLModel, prompt: str, **kwargs) -> TextStream:
     return output
 
 
-DEFAULT_MODEL_NAME = "ggml-gpt4all-j-v1.3-groovy"
-# DEFAULT_MODEL_NAME = "ggml-mpt-7b-chat"
+def model_name_to_tokenizer(name: str):
+    if name == "ggml-gpt4all-j-v1.3-groovy":
+        return transformers.AutoTokenizer.from_pretrained("nomic-ai/gpt4all-j")
+    elif name == "ggml-mpt-7b-chat":
+        return transformers.AutoTokenizer.from_pretrained("nomic-ai/gpt4all-mpt")
+    elif name == "ggml-replit-code-v1-3b":
+        return transformers.AutoTokenizer.from_pretrained("nomic-ai/ggml-replit-code-v1-3b")
+    elif name == "ggml-model-gpt4all-falcon-q4_0":
+        return transformers.AutoTokenizer.from_pretrained("nomic-ai/gpt4all-falcon")
+    elif name == "orca-mini-3b.ggmlv3.q4_0":
+        try:
+            return transformers.AutoTokenizer.from_pretrained("psmathur/orca_mini_3b")
+        except ImportError as e:
+            logging.getLogger().error(f"ImportError: {e} - you may need to install the protobuf package")
+            raise e
+    else:
+        error_msg = f"WARNING: No tokenizer found for model={name}. Defaulting to MPT tokenizer."
+        logger.error(error_msg)
+        # raise Exception(error_msg)
+        return transformers.AutoTokenizer.from_pretrained("nomic-ai/gpt4all-mpt")
+
+
+# DEFAULT_MODEL_NAME = "ggml-gpt4all-j-v1.3-groovy"
+DEFAULT_MODEL_NAME = "ggml-mpt-7b-chat"
 # DEFAULT_MODEL_NAME = "ggml-replit-code-v1-3b"
 
 create_model_lock = threading.Lock()
@@ -167,9 +171,14 @@ class Gpt4AllModel(AbstractCodeCompletionProvider, AbstractChatCompletionProvide
         logger.info(f"creating gpt4all model {self.config}")
         self.name = config.model_name
         self._model_future = None
+        self.ENCODER = model_name_to_tokenizer(self.config.model_name)
 
     async def load(self):
         await self._get_model()
+
+    @cache
+    def get_num_tokens(self, content):
+        return len(self.ENCODER.encode(content))
 
     @property
     async def model(self):
@@ -203,35 +212,59 @@ class Gpt4AllModel(AbstractCodeCompletionProvider, AbstractChatCompletionProvide
         document: str,
         messages: List[Message],
         message: str,
-        cursor_offset: Optional[int] = None,
+        cursor_offset_start: Optional[int] = None,
+        cursor_offset_end: Optional[int] = None,
+        documents: Optional[List[Any]] = None,
     ) -> ChatResult:
         logger.debug("run_chat called")
         model = await self._get_model()
         chatstream = TextStream()
+        non_system_messages = []
+        for msg in messages:
+            logger.debug(str(msg))
+            non_system_messages.append(Message.mk(role=msg.role, content=msg.content))
+        non_system_messages += [Message.user(content=message)]
+        non_system_messages_size = messages_size(non_system_messages)
+        max_system_msg_size = calc_max_system_message_size(
+            non_system_messages_size,
+            max_system_message_size=768,
+            max_context_size=2048,
+            max_len_sampled_completion=256,
+        )
+        # logger.info(f"{max_system_msg_size=}")
+        system_message = create_system_message_chat_truncated(
+            document or "",
+            max_system_msg_size,
+            cursor_offset_start,
+            cursor_offset_end,
+            documents,
+            encoder=self.ENCODER,
+        )
+        # logger.info(f"{system_message=}")
         messages = (
             [
-                Message.system(
-                    f"""
-You are an expert software engineer and world-class systems architect with deep technical and design knowledge. Answer the user's questions about the code as helpfully as possible, quoting verbatim from the current file to support your claims.
-
-Current file:
-```
-{document}
-```
-
-Answer the user's question."""
-                )
+                #                 Message.system(
+                #                     f"""
+                # You are an expert software engineer and world-class systems architect with deep technical and design knowledge. Answer the user's questions about the code as helpfully as possible, quoting verbatim from the current file to support your claims.
+                # Current file:
+                # ```
+                # {document}
+                # ```
+                # Answer the user's question."""
+                #                 )
+                system_message
             ]
             + [Message.mk(role=msg.role, content=msg.content) for msg in messages]
             + [Message.user(content=message)]
         )
 
         num_old_messages = len(messages)
-        messages = auto_truncate(messages)
-
-        logger.info(
-            f"Truncated {num_old_messages - len(messages)} due to context length overflow."
+        # messages = auto_truncate(messages)
+        messages = truncate_messages(
+            messages, max_context_size=2048, max_len_sampled_completion=256
         )
+
+        logger.info(f"Truncated {num_old_messages - len(messages)} due to context length overflow.")
 
         def build_prompt(msgs: List[Message]) -> str:
             result = """### Instruction:
@@ -260,7 +293,5 @@ Answer the user's question."""
 
         t = asyncio.create_task(worker())
         chatstream._feed_task = t
-
-        logger.info("Created chat stream, awaiting results.")
-
+        # logger.info("Created chat stream, awaiting results.")
         return ChatResult(text=chatstream)

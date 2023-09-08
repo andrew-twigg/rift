@@ -1,6 +1,6 @@
 import asyncio
-from typing import Any, AsyncIterable, Callable, Optional
 import logging
+from typing import Any, AsyncIterable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class TextStream:
             )
 
         if self._eof:
+            raise StopAsyncIteration
             raise RuntimeError(f"{func_name} called after feed_eof()")
         if self._feed_task is not None:
             if self._feed_task.done():
@@ -107,9 +108,7 @@ class TextStream:
         if len(self._buffer) < n:
             assert self._eof
             incomplete: Any = self.pop_all()
-            raise EOFError(
-                f"expecting {n - len(incomplete)} more characters but got EOF"
-            )
+            raise EOFError(f"expecting {n - len(incomplete)} more characters but got EOF")
         return self.pop(n)
 
     def __aiter__(self):
@@ -128,7 +127,9 @@ class TextStream:
                     if self._on_cancel is not None:
                         self._on_cancel()
                     raise
-        return self.pop_all()
+        result = self.pop_all()
+        return result
+
     @classmethod
     def from_aiter(cls, x: AsyncIterable[str], loop=None):
         self = cls(loop=loop)
@@ -186,7 +187,10 @@ class TextStream:
                     before.feed_eof()
                     return
                 if len(self._buffer) > len(sep):
+                    # if any(self._buffer.endswith(sep[:k]) for k in range(1, len(sep))):
                     before.feed_data(self.pop(-len(sep)))
+                    # else:
+                    #     before.feed_data(self.pop_all())
                 await self._wait_for_data("split_once()")
 
         before_task = self._loop.create_task(before_worker())

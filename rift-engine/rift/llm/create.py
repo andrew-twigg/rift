@@ -1,21 +1,21 @@
+import logging
+import os
 import functools
 import weakref
-from pydantic import BaseModel, SecretStr
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
-from rift.llm.abstract import (
-    AbstractCodeCompletionProvider,
-    AbstractChatCompletionProvider,
-)
+from pydantic import BaseModel, SecretStr
+
+from rift.llm.abstract import AbstractChatCompletionProvider, AbstractCodeCompletionProvider
 
 
 class ModelConfig(BaseModel):
     chatModel: str
-    completionsModel: str
+    codeEditModel: str
     openaiKey: Optional[SecretStr] = None
 
     def __hash__(self):
-        return hash((self.chatModel, self.completionsModel))
+        return hash((self.chatModel, self.codeEditModel))
 
     def __eq__(self, other):
         return hash(self) == hash(other)
@@ -26,13 +26,13 @@ class ModelConfig(BaseModel):
         return c
 
     def create_completions(self) -> AbstractCodeCompletionProvider:
-        return create_client(self.completionsModel, self.openaiKey)
+        return create_client(self.codeEditModel, self.openaiKey)
 
     @classmethod
     def default(cls):
         return ModelConfig(
-            completionsModel="gpt4all:ggml-replit-code-v1-3b",
-            chatModel="gpt4all:ggml-mpt-7b-chat",
+            codeEditModel="openai:gpt-4",
+            chatModel="openai:gpt-3.5-turbo",
         )
 
 
@@ -58,9 +58,7 @@ def create_client(
         return client
 
 
-def create_client_core(
-    config: str, openai_api_key: Optional[SecretStr]
-) -> AbstractCodeCompletionProvider:
+def parse_type_name_path(config: str) -> Tuple[str, str, str]:
     assert ":" in config, f"Invalid config: {config}"
     type, rest = config.split(":", 1)
     type = type.strip()
@@ -71,6 +69,20 @@ def create_client_core(
         path = ""
     name = name.strip()
     path = path.strip()
+    return (type, name, path)
+
+
+def create_client_core(
+    config: str, openai_api_key: Optional[SecretStr]
+) -> AbstractCodeCompletionProvider:
+    """
+    The function parses the `config` string to extract the `type` and the rest of the configuration. It then checks the `type` and based on that, returns different instances of code completion providers.
+
+    For example, if the `type` is `"hf"`, it imports and returns an instance of `HuggingFaceClient` from `rift.llm.hf_client`. If the `type` is `"openai"`, it imports and returns an instance of `OpenAIClient` from `rift.llm.openai_client` with some additional keyword arguments. If the `type` is `"gpt4all"`, it imports and returns an instance of `Gpt4AllModel` from `rift.llm.gpt4all_model` with some additional settings and keyword arguments.
+
+    If the `type` is none of the above, it raises a `ValueError` with a message indicating that the model is unknown.
+    """
+    type, name, path = parse_type_name_path(config)
     if type == "hf":
         from rift.llm.hf_client import HuggingFaceClient
 
@@ -83,12 +95,15 @@ def create_client_core(
             kwargs["default_model"] = name
         if openai_api_key:
             kwargs["api_key"] = openai_api_key
+        else:
+            if not os.environ.get("OPENAI_API_KEY"):
+                logging.getLogger().error("Trying to create an OpenAIClient without an OpenAI key set in Rift settings or set as the OPENAI_API_KEY environment variable.")
         if path:
             kwargs["api_url"] = path
         return OpenAIClient.parse_obj(kwargs)
 
     elif type == "gpt4all":
-        from rift.llm.gpt4all_model import Gpt4AllSettings, Gpt4AllModel
+        from rift.llm.gpt4all_model import Gpt4AllModel, Gpt4AllSettings
 
         kwargs = {}
         if name:
