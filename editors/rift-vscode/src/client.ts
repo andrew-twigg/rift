@@ -47,6 +47,7 @@ import {
 
 let client: LanguageClient; //LanguageClient
 
+const DEFAULT_HOST: string = vscode.workspace.getConfiguration("rift").get("riftServerHost", "127.0.0.1") || "127.0.0.1";
 const DEFAULT_PORT: number = vscode.workspace.getConfiguration("rift").get("riftServerPort", 7797) || 7797;
 
 // ref: https://stackoverflow.com/questions/40284523/connect-external-language-server-to-vscode-extension
@@ -56,11 +57,12 @@ const DEFAULT_PORT: number = vscode.workspace.getConfiguration("rift").get("rift
 /** Creates the ServerOptions for a system in the case that a language server is already running on the given port. */
 function tcpServerOptions(
   context: ExtensionContext,
-  port = DEFAULT_PORT
+  port = DEFAULT_PORT,
+  host = DEFAULT_HOST
 ): ServerOptions {
   let socket = net.connect({
     port: port,
-    host: "127.0.0.1",
+    host: host,
   });
   const si: StreamInfo = {
     reader: socket,
@@ -393,21 +395,22 @@ export class MorphLanguageClient
     }
 
     const port = DEFAULT_PORT;
+    const host = DEFAULT_HOST;
 
     const autostart: boolean = vscode.workspace.getConfiguration("rift").get("autostart", false) || false;
 
     let serverOptions: ServerOptions;
     if (!autostart) {
-      while (!(await tcpPortUsed.check(port))) {
+      while (!(await tcpPortUsed.check(port, host))) {
         console.log("waiting for server to come online");
         try {
-          await tcpPortUsed.waitUntilUsed(port, 500, 1000000);
+          await tcpPortUsed.waitUntilUsedOnHost(port, host, 500, 1000000);
         } catch (e) {
           console.error(e);
         }
       }
-      console.log(`server detected on port ${port} `);
-      serverOptions = tcpServerOptions(this.context, port);
+      console.log(`server detected on port ${host}:${port} `);
+      serverOptions = tcpServerOptions(this.context, port, host);
     }
     else {
       const serverPort = port + this.restartCount; 
